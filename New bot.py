@@ -27,6 +27,43 @@ if OPENAI_AVAILABLE:
 else:
     log("[VPS LOG] No OpenAI API key found, AI features disabled.")
 
+# ---------------- Per-user DB helpers ----------------
+def get_user_db_path(user_id):
+    os.makedirs("user_dbs", exist_ok=True)
+    return os.path.join("user_dbs", f"{user_id}.db")
+
+def get_user_db_conn(user_id):
+    db_path = get_user_db_path(user_id)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    return conn
+
+def save_valuable_words_threadsafe(user_id, words):
+    conn = get_user_db_conn(user_id)
+    save_valuable_words(conn, user_id, words)
+    conn.close()
+
+async def load_valuable_words_threadsafe(user_id):
+    conn = get_user_db_conn(user_id)
+    words = await load_valuable_words(conn, user_id)
+    conn.close()
+    return words
+
+async def load_ai_memory_threadsafe(user_id, limit=50):
+    conn = get_user_db_conn(user_id)
+    mem = await load_ai_memory(conn, user_id, limit)
+    conn.close()
+    return mem
+
+def mark_urls_sent_threadsafe(user_id, urls, video_ids=None):
+    conn = get_user_db_conn(user_id)
+    mark_urls_sent(conn, urls, video_ids)
+    conn.close()
+
+def save_ai_memory_threadsafe(user_id, query_text, result_urls):
+    conn = get_user_db_conn(user_id)
+    save_ai_memory(conn, user_id, query_text, result_urls)
+    conn.close()
+
 # ---------------- DB helpers ----------------
 def mark_urls_sent(conn: sqlite3.Connection, urls, video_ids=None):
     cur = conn.cursor()
@@ -128,7 +165,7 @@ Return as a JSON array of strings.
     return [query]
 
 # ---------------- Parse user input ----------------
-async def parse_user_request(text: str, memory=None, last_sent_urls=None, db_conn=None):
+async def parse_user_request(text: str, memory=None, last_sent_urls=None, user_id=None):
     text = (text or "").strip()
     if not text:
         return None, 0, None, None
@@ -138,6 +175,8 @@ async def parse_user_request(text: str, memory=None, last_sent_urls=None, db_con
 
     suggested_prompt = None
     query = None
+
+    db_conn = get_user_db_conn(user_id) if user_id else None
 
     if OPENAI_AVAILABLE:
         mem_text = ""
@@ -159,13 +198,22 @@ Return JSON:
 }}
 """
         try:
-            resp = await asyncio.to_thread(lambda: openai.Completion.create(
-                engine="text-davinci-003",
-                prompt=prompt,
-                max_tokens=150,
+            # Save valuable words first
+            cleaned_words = re.sub(r"\b(send|me|need|please|find|the|that|i'm|i am|like|videos|video|of|for|now|what|you|to|do|is|about|okay|bloody|perfect|most|recent)\b", " ", text, flags=re.I)
+            cleaned_words = re.sub(r"\d+", " ", cleaned_words)
+            cleaned_words = re.sub(r"[^\w\s]", " ", cleaned_words)
+            words = [w for w in cleaned_words.split() if len(w) > 1]
+            if db_conn:
+                await asyncio.to_thread(save_valuable_words, db_conn, user_id, words)
+
+            # Use new OpenAI API
+            resp = await openai.chat.completions.acreate(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-            ))
-            raw = resp.choices[0].text.strip()
+                max_tokens=150,
+            )
+            raw = resp.choices[0].message.content.strip()
             j = None
             try:
                 j = json.loads(raw)
@@ -200,12 +248,15 @@ Return JSON:
             query = "fyp"
         # save valuable words
         if db_conn:
-            await asyncio.to_thread(save_valuable_words, db_conn, "user_id_placeholder", words)
+            await asyncio.to_thread(save_valuable_words, db_conn, user_id, words)
 
     # expand query with GPT
-    valuable_words = await load_valuable_words(db_conn, "user_id_placeholder") if db_conn else None
+    valuable_words = await load_valuable_words_threadsafe(user_id) if user_id else None
     alt_prompts = await expand_query_with_gpt(query, valuable_words)
     suggested_prompt = f"I will search {count} videos for '{alt_prompts[0]}', is that okay?"
+
+    if db_conn:
+        db_conn.close()
 
     return query, count, suggested_prompt, alt_prompts
 
@@ -214,7 +265,8 @@ def make_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Next ▶️", callback_data="next")]])
 
 # ---------------- AI Fresh URL filter ----------------
-async def ai_filter_fresh_urls(conn, candidate_urls, desired_count):
+async def ai_filter_fresh_urls(user_id, candidate_urls, desired_count):
+    conn = get_user_db_conn(user_id)
     cur = conn.cursor()
     fresh = []
     for url in candidate_urls:
@@ -224,6 +276,7 @@ async def ai_filter_fresh_urls(conn, candidate_urls, desired_count):
             fresh.append(url)
         if len(fresh) >= desired_count:
             break
+    conn.close()
 
     if OPENAI_AVAILABLE and fresh:
         try:
@@ -252,16 +305,17 @@ Return at most {desired_count} URLs in JSON array format.
 # ---------------- High-level handler ----------------
 CONFIRMATION = range(1)
 
-async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE, tiktok_collect_fn, downloader_fn, db_conn):
+async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE, tiktok_collect_fn, downloader_fn):
     user_text = update.message.text or ""
     user = update.effective_user
+    user_id = user.id
     await update.message.chat.send_action("typing")
     log(f"🤖 user asked: {user_text}")
 
-    memory = await load_ai_memory(db_conn, user.id)
+    memory = await load_ai_memory_threadsafe(user_id)
     last_sent_urls = memory[0]["urls"] if memory else None
 
-    query, count, confirmation_prompt, alt_prompts = await parse_user_request(user_text, memory, last_sent_urls, db_conn)
+    query, count, confirmation_prompt, alt_prompts = await parse_user_request(user_text, memory, last_sent_urls, user_id)
 
     if not query or count <= 0:
         await update.message.reply_text("I couldn't understand your request. Try something like: `send 5 funny edits`")
@@ -279,10 +333,8 @@ async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
             ]
             await update.message.reply_text(confirmation_prompt, reply_markup=InlineKeyboardMarkup(buttons))
-            # Wait for user to press button
             context.user_data["awaiting_confirmation"] = True
             context.user_data["confirmation_result"] = None
-            # Confirmation will be handled by a separate callback handler
 
             while context.user_data.get("awaiting_confirmation"):
                 await asyncio.sleep(0.5)
@@ -311,7 +363,7 @@ async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ No videos found for that query.")
         return
 
-    fresh = await ai_filter_fresh_urls(db_conn, candidate_urls, count)
+    fresh = await ai_filter_fresh_urls(user_id, candidate_urls, count)
     if not fresh:
         await update.message.reply_text("⚠️ No new videos (already sent these).")
         return
@@ -329,8 +381,8 @@ async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Downloads failed or returned no files.")
         return
 
-    mark_urls_sent(db_conn, fresh)
-    save_ai_memory(db_conn, user.id, user_text, fresh)
+    mark_urls_sent_threadsafe(user_id, fresh)
+    save_ai_memory_threadsafe(user_id, user_text, fresh)
 
     sent = 0
     for path in downloaded_paths:
