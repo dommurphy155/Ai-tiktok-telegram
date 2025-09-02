@@ -7,8 +7,8 @@
 import os
 import asyncio
 import sys
+from dotenv import load_dotenv
 from functools import partial
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -18,8 +18,11 @@ from telegram.ext import (
     filters,
 )
 
+os.environ["DISPLAY"] = ":99"
+
+load_dotenv()
+
 from config import (
-    TELEGRA M_BOT_TOKEN as _unused,  # placeholder to avoid linter noise if imported
     TELEGRAM_BOT_TOKEN,
     NETSCAPE_COOKIES_FILE,
     TIKTOK_COOKIES_JSON,
@@ -27,6 +30,7 @@ from config import (
     init_db,
     DB_CONN,
     MAX_VIDEOS_PER_REQUEST,
+    MAX_CONCURRENT_DOWNLOADS
 )
 from tiktok import (
     setup_browser,
@@ -35,8 +39,11 @@ from tiktok import (
     convert_json_to_netscape,
     collect_batch_urls,
 )
+
+
 import downloader  # we'll use downloader.download_batch wrapper
 import bot as bot_module
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # --- Start DB and browser ---
 def start_state():
@@ -65,8 +72,31 @@ def blocking_downloader(urls):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 TikTok AI helper started. Ask me e.g. 'send me 5 creed edits' (max 10)."
+          "🎉 Your TikTok content assistant is ready!\n"
+          "Send a message like ‘3 funny pranks’ and I’ll fetch fresh videos for you.\n\n"
+          "⏳ Each batch takes a little time to gather and download, so please be patient.\n"
+         "⚠️ Only one request at a time, with a maximum of 10 videos per message."
     )
+
+# --- Async downloader wrapper ---
+async def async_downloader(urls):
+    """Download multiple videos concurrently, limited by MAX_CONCURRENT_DOWNLOADS."""
+    out = []
+
+    async def sem_download(url):
+        async with download_semaphore:
+            try:
+                r = await downloader.download_video(url, os.path.join(os.getcwd(), "downloads"))
+                if r:
+                    path, _meta = r
+                    out.append(path)
+            except Exception as e:
+                log(f"[WARNING] downloader failure for {url}: {e}")
+
+    # create tasks
+    tasks = [sem_download(u) for u in urls]
+    await asyncio.gather(*tasks)
+    return out
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # delegate to bot handler; pass driver + blocking_downloader + db_conn
@@ -74,7 +104,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         context,
         tiktok_collect_fn=collect_batch_urls,
-        downloader_fn=blocking_downloader,
+        downloader_fn=async_downloader,
         db_conn=context.application.bot_data["db_conn"],
     )
 
@@ -89,7 +119,7 @@ def build_app(token, driver, db_conn):
     return app
 
 def main():
-    if not TELEG RAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN:
         print("TELEGRAM_BOT_TOKEN env required")
         sys.exit(2)
 
@@ -126,11 +156,11 @@ if __name__ == "__main__":
 # START OF CONFIG.PY
 # ========================
 
-# config.py
 from datetime import datetime
 import os
 import sqlite3
-
+from dotenv import load_dotenv
+load_dotenv()
 # ------------------- Env / Tunables -------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional
@@ -147,6 +177,8 @@ VIDEO_CACHE_MAXLEN = int(os.getenv("VIDEO_CACHE_MAXLEN", "128"))
 MAX_VIDEOS_PER_REQUEST = int(os.getenv("MAX_VIDEOS_PER_REQUEST", "10"))
 
 SEARCH_QUERIES_FALLBACK = ["4k", "edit", "fyp", "funny", "movie"]
+
+MAX_CONCURRENT_DOWNLOADS = 10
 
 # ------------------- Logging -------------------
 def log(msg: str):
@@ -225,23 +257,35 @@ from config import (
 )
 
 # ---------------- Browser setup ----------------
-def setup_browser(geckodriver_path="/usr/bin/geckodriver", headless=True):
-    opts = Options()
-    if headless:
-        opts.headless = True
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.set_preference("permissions.default.image", 2)
-    opts.set_preference("media.autoplay.enabled", False)
-    opts.set_preference("browser.cache.disk.enable", False)
-    opts.set_preference("browser.cache.memory.enable", False)
+def setup_browser():
+    """Start Firefox WebDriver with optimized options."""
+    firefox_options = Options()
+    firefox_options.headless = True
+    firefox_options.add_argument("--no-sandbox")
+    firefox_options.add_argument("--disable-dev-shm-usage")
+    firefox_options.add_argument("--width=800")
+    firefox_options.add_argument("--height=600")
+
+    firefox_options.set_preference("dom.ipc.processCount", 1)              # single process
+    firefox_options.set_preference("browser.tabs.remote.autostart", False) # disable multiprocess
+    firefox_options.set_preference("gfx.webrender.all", False)             # no GPU compositor
+    firefox_options.set_preference("layers.acceleration.disabled", True)   # disable hardware accel
+    firefox_options.set_preference("permissions.default.image", 2)         # block all images
+    firefox_options.set_preference("media.autoplay.enabled", False)        # no video autoplay
+    firefox_options.set_preference("media.hardware-video-decoding.enabled", False)
+    firefox_options.set_preference("browser.cache.disk.enable", False)     # no disk cache
+    firefox_options.set_preference("browser.cache.memory.enable", False)   # no memory cache
+    firefox_options.set_preference("network.prefetch-next", False)         # disable prefetch
+    firefox_options.set_preference("extensions.update.enabled", False)     # no addon updates
+    firefox_options.set_preference("app.update.enabled", False)            # no app updates
+    firefox_options.set_preference("toolkit.telemetry.enabled", False)     # no telemetry
+    firefox_options.set_preference("datareporting.healthreport.uploadEnabled", False)
 
     try:
-        driver = webdriver.Firefox(service=Service(geckodriver_path), options=opts)
-        log("✅ Firefox WebDriver started")
+        driver = webdriver.Firefox(service=Service("/usr/bin/geckodriver"), options=firefox_options)
         return driver
     except WebDriverException as e:
-        log(f"[FATAL] Failed to start webdriver: {e}")
+        log(f"[ERROR] Failed to start Firefox WebDriver: {e}")
         raise
 
 def load_cookies_from_file(path=None):
@@ -318,7 +362,7 @@ def _normalize_href(href):
         return href
     return None
 
-def get_fresh_video_links_for_query(driver, query, desired_count=10, scroll_cycles=6, retries=2):
+def get_fresh_video_links_for_query(driver, query, desired_count=10, scroll_cycles=1, retries=2):
     """
     Navigate to a search URL for `query`, scroll, collect candidate video links.
     Returns up to desired_count unique links.
@@ -327,7 +371,7 @@ def get_fresh_video_links_for_query(driver, query, desired_count=10, scroll_cycl
     encoded = urllib.parse.quote(query_str.replace(",", " "))
     search_url = f"https://www.tiktok.com/search?q={encoded}"
     driver.get(search_url)
-    time.sleep(2 + random.uniform(0.5, 1.5))
+    time.sleep(2 + random.uniform(0.5, 1.0))
     log(f"🔄 Rotating search page: {query_str}")
 
     collected = set()
@@ -337,7 +381,7 @@ def get_fresh_video_links_for_query(driver, query, desired_count=10, scroll_cycl
         # scroll a few times
         for _ in range(scroll_cycles):
             driver.execute_script(f"window.scrollBy(0, {random.randint(800,1600)})")
-            time.sleep(random.uniform(0.8, 1.6))
+            time.sleep(random.uniform(0.8, 1.0))
         try:
             wait = WebDriverWait(driver, 6)
             wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(@href,'/video/')]")))
@@ -345,7 +389,7 @@ def get_fresh_video_links_for_query(driver, query, desired_count=10, scroll_cycl
             # try refresh and another attempt
             try:
                 driver.refresh()
-                time.sleep(1.2)
+                time.sleep(0.7)
             except Exception:
                 pass
 
@@ -416,7 +460,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from config import (
-    TELEGRA M_BOT_TOKEN as _unused,  # placeholder to avoid linter noise if imported
+    TELEGRAM_BOT_TOKEN,  # placeholder to avoid linter noise if imported
     OPENAI_API_KEY,
     MAX_VIDEOS_PER_REQUEST,
     log,
@@ -573,7 +617,7 @@ async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Call downloader (blocking in executor)
     try:
-        downloaded_paths = await loop.run_in_executor(None, lambda: downloader_fn(fresh))
+        downloaded_paths = await downloader_fn(fresh)
     except Exception as e:
         log(f"[ERROR] download step: {e}")
         await update.message.reply_text("❌ Download failed.")
