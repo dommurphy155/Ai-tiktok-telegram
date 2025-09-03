@@ -362,7 +362,7 @@ def _normalize_href(href):
         return href
     return None
 
-def get_fresh_video_links_for_query(driver, query, desired_count=10, scroll_cycles=1, retries=2):
+def get_fresh_video_links_for_query(driver, query, desired_count=10, scroll_cycles=0, retries=2):
     """
     Navigate to a search URL for `query`, scroll, collect candidate video links.
     Returns up to desired_count unique links.
@@ -419,7 +419,6 @@ def rotator_pick_queries():
     from config import SEARCH_QUERIES_FALLBACK
     return SEARCH_QUERIES_FALLBACK[:]
 
-# Simple wrapper used by main: rotate queries and collect links up to batch size
 def collect_batch_urls(driver, query_list, per_query=10, batch_limit=50):
     urls = []
     for q in query_list:
@@ -442,13 +441,6 @@ def collect_batch_urls(driver, query_list, per_query=10, batch_limit=50):
 # START OF BOT.PY
 # ========================
 
-# bot.py
-"""
-Telegram handlers + AI parsing wrapper.
-- Uses OpenAI (if OPENAI_API_KEY present) to parse user prompts.
-- Fallback: simple regex parser.
-"""
-
 import os
 import re
 import json
@@ -457,35 +449,98 @@ import asyncio
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, filters
 
 from config import (
-    TELEGRAM_BOT_TOKEN,  # placeholder to avoid linter noise if imported
-    OPENAI_API_KEY,
     MAX_VIDEOS_PER_REQUEST,
     log,
-    DB_CONN,
+    OPENAI_API_KEY,
 )
-# above line keeps config imported; actual token used in main
 
-# optional OpenAI client
+# --- OpenAI setup ---
 OPENAI_AVAILABLE = bool(OPENAI_API_KEY)
 if OPENAI_AVAILABLE:
     try:
         import openai
         openai.api_key = OPENAI_API_KEY
+        log("[VPS LOG] OpenAI API key is available and will be used.")
     except Exception:
         OPENAI_AVAILABLE = False
+        log("[VPS LOG] OpenAI API key failed to initialize, AI features disabled.")
+else:
+    log("[VPS LOG] No OpenAI API key found, AI features disabled.")
 
-# DB helper
+# ---------------- Per-user DB helpers ----------------
+def get_user_db_path(user_id):
+    os.makedirs("user_dbs", exist_ok=True)
+    return os.path.join("user_dbs", f"{user_id}.db")
+
+def get_user_db_conn(user_id):
+    db_path = get_user_db_path(user_id)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    init_user_db_conn(conn)  # always ensure tables exist
+    return conn
+
+def init_user_db_conn(conn):
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS ai_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT,
+        query_text TEXT,
+        result_urls TEXT,
+        ts TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS valuable_words (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT,
+        word TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS sent_videos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id TEXT,
+        url TEXT,
+        sent_at TEXT
+    )""")
+    conn.commit()
+
+def save_valuable_words_threadsafe(user_id, words):
+    conn = get_user_db_conn(user_id)
+    save_valuable_words(conn, user_id, words)
+    conn.close()
+
+async def load_valuable_words_threadsafe(user_id):
+    conn = get_user_db_conn(user_id)
+    words = await load_valuable_words(conn, user_id)
+    conn.close()
+    return words
+
+async def load_ai_memory_threadsafe(user_id, limit=50):
+    conn = get_user_db_conn(user_id)
+    mem = await load_ai_memory(conn, user_id, limit)
+    conn.close()
+    return mem
+
+def mark_urls_sent_threadsafe(user_id, urls, video_ids=None):
+    conn = get_user_db_conn(user_id)
+    mark_urls_sent(conn, urls, video_ids)
+    conn.close()
+
+def save_ai_memory_threadsafe(user_id, query_text, result_urls):
+    conn = get_user_db_conn(user_id)
+    save_ai_memory(conn, user_id, query_text, result_urls)
+    conn.close()
+
+# ---------------- DB helpers ----------------
 def mark_urls_sent(conn: sqlite3.Connection, urls, video_ids=None):
     cur = conn.cursor()
     ts = datetime.utcnow().isoformat()
     for url in urls:
         vid = (video_ids and video_ids.get(url)) or (url.rstrip("/").split("/")[-1])
         try:
-            cur.execute("INSERT OR IGNORE INTO sent_videos (video_id, url, sent_at) VALUES (?, ?, ?)",
-                        (vid, url, ts))
+            cur.execute(
+                "INSERT OR IGNORE INTO sent_videos (video_id, url, sent_at) VALUES (?, ?, ?)",
+                (vid, url, ts)
+            )
         except Exception:
             pass
     conn.commit()
@@ -493,129 +548,290 @@ def mark_urls_sent(conn: sqlite3.Connection, urls, video_ids=None):
 def save_ai_memory(conn: sqlite3.Connection, user_id, query_text, result_urls):
     cur = conn.cursor()
     ts = datetime.utcnow().isoformat()
-    cur.execute("INSERT INTO ai_memory (user_id, query_text, result_urls, ts) VALUES (?, ?, ?, ?)",
-                (str(user_id), query_text, json.dumps(result_urls), ts))
+    cur.execute(
+        "INSERT INTO ai_memory (user_id, query_text, result_urls, ts) VALUES (?, ?, ?, ?)",
+        (str(user_id), query_text, json.dumps(result_urls), ts)
+    )
     conn.commit()
 
-# parse user natural language into (query_text, num_videos)
-async def parse_user_request(text: str):
+async def load_ai_memory(conn: sqlite3.Connection, user_id, limit=50):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT query_text, result_urls, ts FROM ai_memory WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (str(user_id), limit)
+    )
+    rows = cur.fetchall()
+    mem = []
+    for q, urls, ts in rows:
+        try:
+            urls_list = json.loads(urls)
+        except Exception:
+            urls_list = []
+        mem.append({"query": q, "urls": urls_list, "ts": ts})
+    return mem
+
+def save_valuable_words(conn, user_id, words):
+    cur = conn.cursor()
+    for w in words:
+        try:
+            cur.execute(
+                "INSERT OR IGNORE INTO valuable_words (user_id, word) VALUES (?, ?)",
+                (user_id, w)
+            )
+        except Exception:
+            pass
+    conn.commit()
+
+async def load_valuable_words(conn, user_id):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT word FROM valuable_words WHERE user_id=?",
+        (user_id,)
+    )
+    rows = cur.fetchall()
+    return [r[0] for r in rows]
+
+# ---------------- GPT query expansion ----------------
+async def expand_query_with_gpt(query: str, valuable_words=None, max_prompts=3):
+    if not OPENAI_AVAILABLE:
+        return [query]
+
+    valuable_text = ""
+    if valuable_words:
+        valuable_text = "Previously valuable words: " + ", ".join(valuable_words)
+
+    prompt = f"""
+You are a helpful assistant generating high-quality search prompts for TikTok videos.
+User input: "{query}"
+{valuable_text}
+
+Return up to {max_prompts} alternative search prompts that preserve the user's intent,
+using synonyms and relevant related terms.
+Return as a JSON array of strings.
+"""
+    try:
+        # <<< PATCHED: synchronous call wrapped in asyncio.to_thread >>>
+        resp = await asyncio.to_thread(lambda: openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=150,
+        ))
+        raw = resp.choices[0].message.content.strip()
+        j = None
+        try:
+            j = json.loads(raw)
+        except Exception:
+            m = re.search(r"\[.*\]", raw, re.S)
+            if m:
+                j = json.loads(m.group(0))
+        if j and isinstance(j, list):
+            return j[:max_prompts]
+    except Exception as e:
+        log(f"[AI QUERY EXPANSION ERROR] {e}")
+    return [query]
+
+# ---------------- Parse user input ----------------
+async def parse_user_request(text: str, memory=None, last_sent_urls=None, user_id=None):
     text = (text or "").strip()
     if not text:
-        return None, 0
+        return None, 0, None, None
 
-    # if AI is available, ask it to extract: {query, count}
+    if last_sent_urls and re.search(r"more (like|similar) (the )?(last|previous)", text, re.I):
+        return "__FOLLOWUP__", len(last_sent_urls), f"Do you want me to send {len(last_sent_urls)} more videos similar to the last ones?", None
+
+    suggested_prompt = None
+    query = None
+
+    db_conn = get_user_db_conn(user_id) if user_id else None
+
     if OPENAI_AVAILABLE:
-        prompt = (
-            "Extract a short search query and a number of videos from this user instruction.\n"
-            "Return JSON like: {\"query\":\"...\",\"count\":N}\n\n"
-            f"Instruction: '''{text}'''"
-        )
+        mem_text = ""
+        if memory:
+            mem_text = "\nUser history:\n" + "\n".join([f"{m['ts']}: {m['query']}" for m in memory])
+        prompt = f"""
+You are a smart assistant helping fetch TikTok videos.
+User instruction: '''{text}'''
+{mem_text}
+
+Correct typos, understand intent, and extract:
+1. A short search query (what to search for)
+2. Number of videos (1-{MAX_VIDEOS_PER_REQUEST})
+
+Return JSON:
+{{
+"query": "...",
+"count": N
+}}
+"""
         try:
-            resp = openai.Completion.create(
-                engine="text-davinci-003",
-                prompt=prompt,
-                max_tokens=60,
+            cleaned_words = re.sub(r"\b(send|me|need|please|find|the|that|i'm|i am|like|videos|video|of|for|now|what|you|to|do|is|about|okay|bloody|perfect|most|recent)\b", " ", text, flags=re.I)
+            cleaned_words = re.sub(r"\d+", " ", cleaned_words)
+            cleaned_words = re.sub(r"[^\w\s]", " ", cleaned_words)
+            words = [w for w in cleaned_words.split() if len(w) > 1]
+            if db_conn:
+                await asyncio.to_thread(save_valuable_words, db_conn, user_id, words)
+
+            # <<< PATCHED: synchronous call wrapped in asyncio.to_thread >>>
+            resp = await asyncio.to_thread(lambda: openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-            )
-            raw = resp.choices[0].text.strip()
-            # attempt to find JSON in reply
+                max_tokens=150,
+            ))
+            raw = resp.choices[0].message.content.strip()
             j = None
             try:
                 j = json.loads(raw)
             except Exception:
-                # try to extract substring that looks like json
                 m = re.search(r"\{.*\}", raw, re.S)
                 if m:
                     j = json.loads(m.group(0))
             if j:
-                q = j.get("query", "").strip()
-                c = int(j.get("count") or 0)
-                return q, min(max(0, c), MAX_VIDEOS_PER_REQUEST)
-        except Exception:
-            pass
+                query = j.get("query", "").strip()
+                count = int(j.get("count") or 3)
+                count = min(max(1, count), MAX_VIDEOS_PER_REQUEST)
+        except Exception as e:
+            log(f"[AI PARSE ERROR] {e}")
 
-    # Fallback rule-based parsing:
-    # Try to find a number in the message
-    m = re.search(r"(\d+)\s*(?:videos|video|v)?", text, re.I)
-    count = int(m.group(1)) if m else 3
-    if count > MAX_VIDEOS_PER_REQUEST:
-        count = MAX_VIDEOS_PER_REQUEST
+    if not query:
+        m = re.search(r"(\d+)\s*(?:videos|video|v)?", text, re.I)
+        count = int(m.group(1)) if m else 3
+        count = min(count, MAX_VIDEOS_PER_REQUEST)
 
-    # Heuristic: remove common words and return the rest as query
-    # e.g. "send me 5 creed edits" -> "creed edits"
-    q = re.sub(r"\b(send|me|need|please|find|the|that|i'm|i am|like|videos|video|of|for)\b", " ", text, flags=re.I)
-    q = re.sub(r"\d+", "", q)
-    q = re.sub(r"[^\w\s]", " ", q)
-    q = " ".join([w for w in q.split() if len(w) > 1])[:120].strip()
-    if not q:
-        q = "fyp"
-    return q, count
+        COMMON_WORDS = r"\b(send|me|need|please|find|the|that|i'm|i am|like|videos|video|of|for|now|what|you|to|do|is|about|okay|bloody|perfect|most|recent)\b"
+        cleaned = re.sub(COMMON_WORDS, " ", text, flags=re.I)
+        cleaned = re.sub(r"\d+", " ", cleaned)
+        cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+        words = [w for w in cleaned.split() if len(w) > 1]
+        if m:
+            num_index = text.lower().split().index(m.group(1))
+            context_words = text.split()[num_index+1:num_index+6]
+            words += [w for w in context_words if len(w) > 1]
+        query = " ".join(words)[:120].strip()
+        if not query:
+            query = "fyp"
+        if db_conn:
+            await asyncio.to_thread(save_valuable_words, db_conn, user_id, words)
 
-# Reply keyboard helper
+    valuable_words = await load_valuable_words_threadsafe(user_id) if user_id else None
+    alt_prompts = await expand_query_with_gpt(query, valuable_words)
+    suggested_prompt = f"I will search {count} videos for '{alt_prompts[0]}', is that okay?"
+
+    if db_conn:
+        db_conn.close()
+
+    return query, count, suggested_prompt, alt_prompts
+
+# ---------------- Telegram helpers ----------------
 def make_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Next ▶️", callback_data="next")]])
 
-# high-level handler invoked by main
-async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE, tiktok_collect_fn, downloader_fn, db_conn):
-    """
-    tiktok_collect_fn(driver, query, count) -> list of urls
-    downloader_fn(urls, outdir) -> list of downloaded paths
-    """
+# ---------------- AI Fresh URL filter ----------------
+async def ai_filter_fresh_urls(user_id, candidate_urls, desired_count):
+    conn = get_user_db_conn(user_id)
+    cur = conn.cursor()
+    fresh = []
+    for url in candidate_urls:
+        vid = url.rstrip("/").split("/")[-1]
+        cur.execute("SELECT 1 FROM sent_videos WHERE video_id = ?", (vid,))
+        if not cur.fetchone():
+            fresh.append(url)
+        if len(fresh) >= desired_count:
+            break
+    conn.close()
+
+    if OPENAI_AVAILABLE and fresh:
+        try:
+            prompt = f"""
+Given these TikTok URLs: {fresh}
+Filter out duplicates, near-duplicates, or URLs that seem already known.
+Return at most {desired_count} URLs in JSON array format.
+"""
+            resp = await asyncio.to_thread(lambda: openai.Completion.create(
+                engine="text-davinci-003",
+                prompt=prompt,
+                max_tokens=300,
+                temperature=0.0,
+            ))
+            raw = resp.choices[0].text.strip()
+            try:
+                j = json.loads(raw)
+                if isinstance(j, list):
+                    fresh = j[:desired_count]
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"[AI FILTER ERROR] {e}")
+    return fresh[:desired_count]
+
+# ---------------- High-level handler ----------------
+CONFIRMATION = range(1)
+
+# ---- MODIFIED handle_user_request: added db_conn keyword ----
+async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE, tiktok_collect_fn, downloader_fn, *, db_conn=None):
     user_text = update.message.text or ""
     user = update.effective_user
+    user_id = user.id
     await update.message.chat.send_action("typing")
     log(f"🤖 user asked: {user_text}")
 
-    query, count = await parse_user_request(user_text)
+    memory = await load_ai_memory_threadsafe(user_id)
+    last_sent_urls = memory[0]["urls"] if memory else None
+
+    query, count, confirmation_prompt, alt_prompts = await parse_user_request(user_text, memory, last_sent_urls, user_id)
+
     if not query or count <= 0:
-        await update.message.reply_text("I couldn't understand what you want. Try: `send 5 creed edits`")
+        await update.message.reply_text("I couldn't understand your request. Try something like: `send 5 funny edits`")
         return
 
-    # enforce limit
-    if count > MAX_VIDEOS_PER_REQUEST:
-        await update.message.reply_text(f"⚠️ Max videos per request is {MAX_VIDEOS_PER_REQUEST}")
-        return
+    if query == "__FOLLOWUP__" and last_sent_urls:
+        candidate_urls = last_sent_urls
+        await update.message.reply_text(confirmation_prompt)
+    else:
+        if confirmation_prompt:
+            buttons = [
+                [InlineKeyboardButton("✅ Yes", callback_data="confirm")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            ]
+            await update.message.reply_text(confirmation_prompt, reply_markup=InlineKeyboardMarkup(buttons))
+            context.user_data["awaiting_confirmation"] = True
+            context.user_data["confirmation_result"] = None
 
-    await update.message.reply_text(f"🔎 Searching TikTok for: \"{query}\" (will try to return {count} videos)")
+            while context.user_data.get("awaiting_confirmation"):
+                await asyncio.sleep(0.5)
 
-    # call into tiktok (driver is handled in main)
-    driver = context.bot_data.get("tiktok_driver")
-    if not driver:
-        await update.message.reply_text("⚠️ Scraper not available right now. Try again later.")
-        return
+            if context.user_data.get("confirmation_result") != "confirm":
+                await update.message.reply_text("❌ Search cancelled.")
+                return
 
-    # collect URLs (do not block bot UI; run in executor)
-    loop = asyncio.get_running_loop()
-    try:
-        urls = await loop.run_in_executor(None, lambda: tiktok_collect_fn(driver, [query], per_query=count, batch_limit=count))
-    except Exception as e:
-        log(f"[ERROR] collecting URLs: {e}")
-        await update.message.reply_text("❌ Failed to collect video links.")
-        return
+        driver = context.bot_data.get("tiktok_driver")
+        if not driver:
+            await update.message.reply_text("⚠️ Scraper not available right now. Try again later.")
+            return
 
-    if not urls:
+        loop = asyncio.get_running_loop()
+        try:
+            candidate_urls = await loop.run_in_executor(
+                None,
+                lambda: tiktok_collect_fn(driver, [query], per_query=count, batch_limit=count)
+            )
+        except Exception as e:
+            log(f"[ERROR] collecting URLs: {e}")
+            await update.message.reply_text("❌ Failed to collect video links.")
+            return
+
+    if not candidate_urls:
         await update.message.reply_text("⚠️ No videos found for that query.")
         return
 
-    # deduplicate against DB
-    cur = db_conn.cursor()
-    fresh = []
-    for u in urls:
-        vid = u.rstrip("/").split("/")[-1]
-        cur.execute("SELECT 1 FROM sent_videos WHERE video_id = ?", (vid,))
-        if cur.fetchone():
-            continue
-        fresh.append(u)
-        if len(fresh) >= count:
-            break
-
+    fresh = await ai_filter_fresh_urls(user_id, candidate_urls, count)
     if not fresh:
-        await update.message.reply_text("⚠️ No new videos (looks like I've already sent these).")
+        await update.message.reply_text("⚠️ No new videos (already sent these).")
         return
 
     await update.message.reply_text(f"⬇️ Downloading {len(fresh)} videos now...")
 
-    # Call downloader (blocking in executor)
     try:
         downloaded_paths = await downloader_fn(fresh)
     except Exception as e:
@@ -627,11 +843,9 @@ async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Downloads failed or returned no files.")
         return
 
-    # Mark URLs in DB
-    mark_urls_sent(db_conn, fresh)
-    save_ai_memory(db_conn, user.id, user_text, fresh)
+    mark_urls_sent_threadsafe(user_id, fresh)
+    save_ai_memory_threadsafe(user_id, user_text, fresh)
 
-    # Send videos serially (async)
     sent = 0
     for path in downloaded_paths:
         try:
@@ -641,6 +855,14 @@ async def handle_user_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             log(f"[WARNING] Failed sending {path}: {e}")
     await update.message.reply_text(f"✅ Sent {sent} videos.")
+
+# ---------------- Confirmation button handler ----------------
+async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if context.user_data.get("awaiting_confirmation"):
+        context.user_data["confirmation_result"] = query.data
+        context.user_data["awaiting_confirmation"] = False
 
 
 # ========================
